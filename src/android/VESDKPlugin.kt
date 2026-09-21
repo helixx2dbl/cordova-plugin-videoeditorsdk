@@ -321,7 +321,12 @@ class VESDKPlugin : CordovaPlugin() {
         this.callback = callbackContext
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent) {
+    // TSY fork: data MUST be nullable. Cordova cancels a still-pending activity by calling
+    // onActivityResult(requestCode, RESULT_CANCELED, null) from setActivityResultCallback(). With a
+    // non-null Intent, kotlin's parameter check threw inside whichever plugin was starting the next
+    // activity (the camera picker), and because that throw lands before cordova reassigns the
+    // callback, every later pick failed the same way until the app was force-quit.
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == EDITOR_RESULT_ID) {
             when (resultCode) {
                 Activity.RESULT_OK -> success(data)
