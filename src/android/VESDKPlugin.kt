@@ -45,6 +45,9 @@ class VESDKPlugin : CordovaPlugin() {
     /** The currently used configuration. */
     private var currentConfig: Configuration? = null
 
+    /** TSY fork: java.io.tmpdir as it was before we redirected it for the editor session. */
+    private var previousTmpDir: String? = null
+
     override fun onStart() {
         IMGLY.initSDK(this.cordova.activity)
         IMGLY.authorize()
@@ -194,12 +197,63 @@ class VESDKPlugin : CordovaPlugin() {
     private fun startEditor(settingsList: VideoEditorSettingsList) {
         val currentActivity = cordova.activity ?: throw RuntimeException("Can't start the Editor because there is no current activity")
         cordova.setActivityResultCallback(this)
+        redirectTmpDir()
         MainThreadRunnable {
             EditorBuilder(currentActivity)
                 .setSettingsList(settingsList)
                 .startActivityForResult(currentActivity, EDITOR_RESULT_ID, arrayOfNulls(0))
             settingsList.release()
         }()
+    }
+
+    // TSY fork: clips added with the + inside the editor are copied by the sdk via
+    // File.createTempFile("uriCache", ".tmp"), which lands in java.io.tmpdir = cache/. android trims
+    // cache/ under storage pressure, so during a long edit those copies vanished and the export failed
+    // with "Couldn't load file". For the editor's lifetime we point tmpdir at a folder under files/,
+    // which is never trimmed. android's createTempFile re-reads the property on every call, so
+    // restoring it in onActivityResult bounds the redirect to exactly the editor session. The sdk marks
+    // its copies deleteOnExit, which never fires on android, so we wipe the folder ourselves.
+    private fun editorTmpDir(): File {
+        return File(cordova.activity.filesDir, "vesdk_tmp")
+    }
+
+    private fun redirectTmpDir() {
+        val dir = editorTmpDir()
+        wipeTmpDir() // leftovers from a process kill mid-edit
+        dir.mkdirs()
+        previousTmpDir = System.getProperty("java.io.tmpdir")
+        System.setProperty("java.io.tmpdir", dir.absolutePath)
+    }
+
+    private fun restoreTmpDir() {
+        val previous = previousTmpDir
+        if (previous != null) {
+            System.setProperty("java.io.tmpdir", previous)
+            previousTmpDir = null
+        }
+    }
+
+    /** How many files the sdk copied into our tmp folder this session, and their total size. */
+    private fun tmpDirStats(): Pair<Int, Long> {
+        val files = editorTmpDir().listFiles() ?: return Pair(0, 0L)
+        var count = 0
+        var bytes = 0L
+        for (file in files) {
+            if (file.isFile) {
+                count++
+                bytes += file.length()
+            }
+        }
+        return Pair(count, bytes)
+    }
+
+    private fun wipeTmpDir() {
+        val files = editorTmpDir().listFiles() ?: return
+        for (file in files) {
+            if (file.isFile) {
+                file.delete()
+            }
+        }
     }
 
     /**
@@ -283,6 +337,7 @@ class VESDKPlugin : CordovaPlugin() {
             }
             val result = createResult(resultPath, sourcePath?.path != resultPath?.path, serialization)
             callback?.success(result)
+            wipeTmpDir()
 
         }()
     }
@@ -314,6 +369,10 @@ class VESDKPlugin : CordovaPlugin() {
         result.put("video", video)
         result.put("hasChanges", hasChanges)
         result.put("serialization", serialization)
+        // TSY fork: diagnostics for the app's error report - clips added with the + inside the editor
+        val stats = tmpDirStats()
+        result.put("tmpClipCount", stats.first)
+        result.put("tmpClipBytes", stats.second)
         return result
     }
 
@@ -328,13 +387,19 @@ class VESDKPlugin : CordovaPlugin() {
     // callback, every later pick failed the same way until the app was force-quit.
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == EDITOR_RESULT_ID) {
+            restoreTmpDir() // the editor is gone, so nothing else must land in our folder
             when (resultCode) {
                 Activity.RESULT_OK -> success(data)
                 Activity.RESULT_CANCELED -> {
-                    val nullValue: String? = null
-                    callback?.success(nullValue) // return null
+                    // TSY fork: upstream returned a bare null here. A result with video = null still reads as
+                    // a cancel to the app, and carries the tmp-clip diagnostics along.
+                    callback?.success(createResult(null, false, null))
+                    wipeTmpDir()
                 }
-                else -> callback?.error("Media error (code $resultCode)")
+                else -> {
+                    callback?.error("Media error (code $resultCode)")
+                    wipeTmpDir()
+                }
             }
         }
     }
